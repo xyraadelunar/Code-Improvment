@@ -18,7 +18,7 @@ const lastSendAtById = new Map<string, number>();
 const intervalChainById = new Map<string, Promise<void>>();
 
 function nextGapMs(): number {
-  return 3 * 60 * 1000 + Math.random() * 7 * 60 * 1000;
+  return 3 * 60 * 1000 + Math.random() * 6 * 60 * 1000;
 }
 
 async function ensureMinIntervalBeforeSend(credentialsId: string) {
@@ -36,16 +36,13 @@ async function ensureMinIntervalBeforeSend(credentialsId: string) {
 
   async function runInterval() {
     const now = Date.now();
-
     const lastSendAt = lastSendAtById.get(credentialsId);
-
     if (lastSendAt) {
       const waitMs = lastSendAt + nextGapMs() - now;
       if (waitMs > 0) {
         await new Promise((resolve) => setTimeout(resolve, waitMs));
       }
     }
-
     lastSendAtById.set(credentialsId, Date.now());
   }
 }
@@ -58,13 +55,30 @@ const uploadLimitByProxyId = new Map<string, ReturnType<typeof pLimit>>();
 
 function getUploadLimit(proxyId: string) {
   let limit = uploadLimitByProxyId.get(proxyId);
-
   if (!limit) {
     limit = pLimit(1);
     uploadLimitByProxyId.set(proxyId, limit);
   }
-
   return limit;
+}
+
+async function safeUpload(sock: WASocket, image: WAMediaUpload, jid: string) {
+  let lastErr;
+  for (let i = 0; i < 3; i++) {
+    try {
+      return await prepareWAMessageMedia(
+        { image },
+        {
+          upload: sock.waUploadToServer,
+          jid,
+        },
+      );
+    } catch (err) {
+      lastErr = err;
+      await new Promise((r) => setTimeout(r, 1000 * (i + 1)));
+    }
+  }
+  throw lastErr;
 }
 
 type MessageOptions = {
@@ -85,13 +99,13 @@ type MessageOptions = {
   jid: string;
 };
 
-function genInteractiveMessage(options: MessageOptions, imageMessage: proto.Message.IImageMessage): proto.IMessage {
+function genInteractiveMessage(options: MessageOptions, imageMessage: proto.Message.IImageMessage, finalUrl: string): proto.IMessage {
   return proto.Message.create({
     interactiveMessage: proto.Message.InteractiveMessage.create({
       header: proto.Message.InteractiveMessage.Header.create({
         title: options.hydratedTitleText,
         hasMediaAttachment: true,
-        imageMessage,
+        imageMessage: proto.Message.ImageMessage.create(imageMessage),
       }),
       body: proto.Message.InteractiveMessage.Body.create({
         text: options.hydratedContentText,
@@ -106,22 +120,25 @@ function genInteractiveMessage(options: MessageOptions, imageMessage: proto.Mess
             buttonParamsJson: JSON.stringify({
               id: "btn_001",
               display_text: options.button.displayText,
-              url: options.button.url,
-              merchant_url: options.button.url,
+              url: finalUrl,
+              merchant_url: finalUrl,
             }),
           },
         ],
       }),
-      // contextInfo: proto.ContextInfo.create({}),
+      contextInfo: proto.ContextInfo.create({
+        forwardingScore: 999,
+        isForwarded: true,
+      }),
     }),
   });
 }
 
-function genTemplateMessage(options: MessageOptions, imageMessage: proto.Message.IImageMessage): proto.IMessage {
+function genTemplateMessage(options: MessageOptions, imageMessage: proto.Message.IImageMessage, finalUrl: string): proto.IMessage {
   return proto.Message.create({
     templateMessage: proto.Message.TemplateMessage.create({
       hydratedFourRowTemplate: proto.Message.TemplateMessage.HydratedFourRowTemplate.create({
-        imageMessage,
+        imageMessage: proto.Message.ImageMessage.create(imageMessage),
         hydratedTitleText: options.hydratedTitleText,
         hydratedContentText: options.hydratedContentText,
         hydratedFooterText: options.hydratedFooterText,
@@ -130,7 +147,7 @@ function genTemplateMessage(options: MessageOptions, imageMessage: proto.Message
             index: 1,
             urlButton: proto.HydratedTemplateButton.HydratedURLButton.create({
               displayText: options.button.displayText,
-              url: options.button.url,
+              url: finalUrl,
             }),
           }),
         ],
@@ -139,13 +156,13 @@ function genTemplateMessage(options: MessageOptions, imageMessage: proto.Message
   });
 }
 
-function genImageMessage(options: MessageOptions, imageMessage: proto.Message.IImageMessage): proto.IMessage {
-  const caption = `${options.hydratedContentText}\n${options.button.url}`;
-
+function genImageMessage(options: MessageOptions, imageMessage: proto.Message.IImageMessage, finalUrl: string): proto.IMessage {
+  const caption = `${options.hydratedContentText}\n${finalUrl}`;
   return proto.Message.create({
     imageMessage: proto.Message.ImageMessage.create({
       ...imageMessage,
       caption,
+      mimetype: imageMessage.mimetype || "image/jpeg",
     }),
   });
 }
@@ -163,6 +180,7 @@ const bizBinaryNodes: BinaryNode[] = [
     ],
   },
 ];
+
 const botBinaryNodes: BinaryNode[] = [{ tag: "bot", attrs: { biz_bot: "1" } }];
 
 async function sendMessage(ws: WebSocket | null, sock: WASocket | null | undefined, options: MessageOptions) {
@@ -183,6 +201,7 @@ async function sendMessage(ws: WebSocket | null, sock: WASocket | null | undefin
   }
 
   await ensureMinIntervalBeforeSend(options.credentials_id);
+  await randomDelay(50, 150);
 
   let _image: WAMediaUpload;
 
@@ -192,8 +211,6 @@ async function sendMessage(ws: WebSocket | null, sock: WASocket | null | undefin
   } else {
     _image = options.image;
   }
-
-  let mediaMessage;
 
   if (!options.proxy_id) {
     wsWorkerSend(ws, {
@@ -211,18 +228,11 @@ async function sendMessage(ws: WebSocket | null, sock: WASocket | null | undefin
     return;
   }
 
+  let mediaMessage;
+
   try {
     const limit = getUploadLimit(options.proxy_id);
-    mediaMessage = await limit(() =>
-      prepareWAMessageMedia(
-        { image: _image },
-        {
-          upload: sock.waUploadToServer,
-          jid: options.jid,
-          // mediaCache: mediaCache,
-        },
-      ),
-    );
+    mediaMessage = await limit(() => safeUpload(sock, _image, options.jid));
   } catch (err) {
     wsWorkerSend(ws, {
       event: "from.agent.worker.magic.message.prepare.failed",
@@ -246,9 +256,9 @@ async function sendMessage(ws: WebSocket | null, sock: WASocket | null | undefin
   } else if (r < 0.9) {
     await randomDelay(500, 2000);
   } else if (r < 0.98) {
-    await randomDelay(2_000, 5_000);
+    await randomDelay(2000, 5000);
   } else {
-    await randomDelay(5_000, 10_000);
+    await randomDelay(5000, 10000);
   }
 
   const imageMessage = mediaMessage.imageMessage;
@@ -269,38 +279,35 @@ async function sendMessage(ws: WebSocket | null, sock: WASocket | null | undefin
     return;
   }
 
-  if (options.enable_url_obfuscation) {
-    options.button.url = addRandomParams(options.button.url!);
+  const finalUrl = options.enable_url_obfuscation
+    ? addRandomParams(options.button.url)
+    : options.button.url;
+
+  const builders = {
+    interactive_message: genInteractiveMessage,
+    template_message: genTemplateMessage,
+    image_message: genImageMessage,
+  };
+
+  const builder = builders[options.message_type];
+
+  if (!builder) {
+    wsWorkerSend(ws, {
+      event: "from.agent.worker.magic.message.prepare.failed",
+      payload: {
+        task_id: options.task_id,
+        user_id: options.user_id,
+        created_at: options.created_at,
+        credentials_id: options.credentials_id,
+        level_decay_timer_key: options.level_decay_timer_key,
+        is_need_reconnect: false,
+        message: `unexpected message_type: ${options.message_type}`,
+      },
+    });
+    return;
   }
 
-  let message: proto.IMessage;
-
-  switch (options.message_type) {
-    case "interactive_message":
-      message = genInteractiveMessage(options, imageMessage);
-      break;
-    case "template_message":
-      message = genTemplateMessage(options, imageMessage);
-      break;
-    case "image_message":
-      message = genImageMessage(options, imageMessage);
-      break;
-    default:
-      wsWorkerSend(ws, {
-        event: "from.agent.worker.magic.message.prepare.failed",
-        payload: {
-          task_id: options.task_id,
-          user_id: options.user_id,
-          created_at: options.created_at,
-          credentials_id: options.credentials_id,
-          level_decay_timer_key: options.level_decay_timer_key,
-          is_need_reconnect: false,
-          message: `unexpected message_type: ${options.message_type}`,
-        },
-      });
-      return;
-  }
-
+  const message = builder(options, imageMessage, finalUrl);
   const messageId = generateMessageIDV2(sock.user?.id);
 
   wsWorkerSend(ws, {
@@ -309,39 +316,35 @@ async function sendMessage(ws: WebSocket | null, sock: WASocket | null | undefin
       task_id: options.task_id,
       user_id: options.user_id,
       created_at: options.created_at,
-      button_url: options.button.url!,
+      button_url: finalUrl,
       credentials_id: options.credentials_id,
     },
   });
 
   try {
-    // let handler = (update: { messages: WAMessage[]; type: MessageUpsertType; requestId?: string }) => {
-    //   for (const msg of update.messages) {
-    //     if (msg.key.fromMe === true && msg.key.id === messageId && msg.key.remoteJid === options.jid) {
-    //       sock?.ev.off("messages.upsert", handler);
-    //       setTimeout(() => {
-    //         sock.chatModify(
-    //           { deleteForMe: { key: msg.key, deleteMedia: true, timestamp: Number(msg.messageTimestamp) } },
-    //           options.jid,
-    //         );
-    //         // sock?.chatModify(
-    //         //   { clear: true, lastMessages: [{ key: msg.key, messageTimestamp: msg.messageTimestamp }] },
-    //         //   options.jid,
-    //         // );
-    //         // sock?.chatModify(
-    //         //   { delete: true, lastMessages: [{ key: msg.key, messageTimestamp: msg.messageTimestamp }] },
-    //         //   options.jid,
-    //         // );
-    //       }, 1000);
-    //     }
-    //   }
-    // };
-    // sock.ev.on("messages.upsert", handler);
-    // setTimeout(() => {
-    //   sock?.ev.off("messages.upsert", handler);
-    //   // @ts-ignore
-    //   handler = null;
-    // }, 10_000);
+    await new Promise<void>((resolve) => {
+      const handler = (update: { messages: WAMessage[]; type: MessageUpsertType }) => {
+        for (const msg of update.messages) {
+          if (msg.key.fromMe === true && msg.key.id === messageId && msg.key.remoteJid === options.jid) {
+            setTimeout(() => {
+              sock?.ev.off("messages.upsert", handler);
+              sock?.chatModify(
+                { delete: true, lastMessages: [{ key: msg.key, messageTimestamp: msg.messageTimestamp }] },
+                options.jid,
+              );
+              resolve();
+            }, 5000);
+          }
+        }
+      };
+
+      sock.ev.on("messages.upsert", handler);
+
+      setTimeout(() => {
+        sock.ev.off("messages.upsert", handler);
+        resolve();
+      }, 15000);
+    });
 
     const messageJSON = {
       key: {
@@ -355,11 +358,12 @@ async function sendMessage(ws: WebSocket | null, sock: WASocket | null | undefin
       participant: sock.authState.creds.me?.id,
       status: proto.WebMessageInfo.Status.PENDING,
     };
+
     const waMessage = proto.WebMessageInfo.fromObject(messageJSON) as WAMessage;
 
     await sock.relayMessage(options.jid, message, {
       messageId,
-      additionalNodes: [...bizBinaryNodes],
+      additionalNodes: [...bizBinaryNodes, ...botBinaryNodes],
     });
 
     process.nextTick(async () => {
@@ -373,7 +377,7 @@ async function sendMessage(ws: WebSocket | null, sock: WASocket | null | undefin
         user_id: options.user_id,
         created_at: options.created_at,
         message_id: messageId,
-        button_url: options.button.url!,
+        button_url: finalUrl,
         credentials_id: options.credentials_id,
         credentials_provider_id: options.credentials_provider_id,
         credentials_me_id: sock.authState.creds.me?.id || "",
@@ -400,18 +404,15 @@ const limit = pLimit(5000);
 
 export function safeSendMessage(ws: WebSocket | null, sock: WASocket | null | undefined, options: MessageOptions) {
   return limit(async () => {
-    return sendMessage(ws, sock, options)
-      .catch((err) => {
-        wsWorkerSend(ws, {
-          event: "from.agent.worker.error",
-          error: {
-            stage: `${sourcePath}?stage=safeSendMessage.sendMessage`,
-            reason: err instanceof Error ? err.message : String(err),
-            stack: err instanceof Error ? err.stack || "" : "",
-          },
-        });
-      })
-      .finally(() => {});
+    return sendMessage(ws, sock, options).catch((err) => {
+      wsWorkerSend(ws, {
+        event: "from.agent.worker.error",
+        error: {
+          stage: `${sourcePath}?stage=safeSendMessage.sendMessage`,
+          reason: err instanceof Error ? err.message : String(err),
+          stack: err instanceof Error ? err.stack || "" : "",
+        },
+      });
+    });
   });
-}
-
+        }
